@@ -1,0 +1,22 @@
+ANALYTIC HAND-CALCS ONLY -- NOT FEA. PETG Z-strength 25 MPa assumed;
+allowables: 12 MPa peak, 8 MPa cyclic (knockdowns for print variance).
+
+Check                                        Stress   Allow  Margin
+Hinge pin shear (15 N yank)                   3.12 MPa  12.0 MPa    3.8x
+Knuckle bearing on pin                        1.71 MPa  12.0 MPa    7.0x
+Knuckle root bending (15 N yank)             11.11 MPa  12.0 MPa    1.1x
+Press-cap wall compression (25 N)             0.33 MPa   8.0 MPa   24.5x
+Can-bore wall, off-axis press                 0.05 MPa   8.0 MPa  160.0x
+Faceplate pocket floor, button 5 N            3.83 MPa   8.0 MPa    2.1x
+Nozzle-block screw shear (25 N / 2)           6.22 MPa  12.0 MPa    1.9x
+Nozzle-block screw pull-out                   0.50 MPa   8.0 MPa   16.1x
+
+Weakest link: knuckle root bending, 1.1x at a 15 N yank -- but that
+is a worst-case yank; at a realistic 5 N fold force the margin is
+3.2x. Next thinnest: nozzle-block screw shear (1.9x at 25 N fire
+force; conservative -- the block also bears on the pocket floor)
+and faceplate pocket floor (2.1x). All other margins >3.8x.
+Press path margins are otherwise >10x: the can valve spring (25 N)
+is small against PETG section sizes. The real risks are FATIGUE
+and CREEP, not one-off yield -- hence PETG (not PLA) and the
+1,000-fold + 100-press acceptance tests in the build notes.
