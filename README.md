@@ -29,7 +29,7 @@ dose log dumps as CSV over serial.
 | Folded size (measured from the STLs) | **50.0 × 94.0 × 38.0 mm (1.97" × 3.70" × 1.50")** — fits a 4" × 2" box |
 | Screen | 1.54" 200×200 e-ink, GDEH0154D67 / GDEY0154D67 (27×27 mm active) |
 | Brain | Seeed XIAO nRF52840 |
-| Battery | 110 mAh LiPo (301230); ~13 months typical use without Find My (modeled — see below) |
+| Battery | 110 mAh LiPo (301230); ~13 months typical use, beacon off — ~4.5 months with the OpenHaystack beacon on (both modeled estimates) |
 | Dose sensing | Reed switch + magnet on the canister press |
 | Mouthpiece | Folds flush into the body; flattened oval 20×9 mm, like an inhaler mouthpiece |
 | Weight | ~115–120 g assembled (estimated — about 2.3× a stock inhaler) |
@@ -48,6 +48,13 @@ dose log dumps as CSV over serial.
   react only to device facts — kind, never shaming.
 - **No app.** Nothing to install, no account, no server that can shut down
   and brick the device.
+- **Find My tracking (OpenHaystack).** The firmware broadcasts a rotating
+  public key as an Apple Offline Finding beacon, so any nearby iPhone can
+  report the inhaler's location — no MFi, no Apple approval, no companion
+  app. Keys are generated on your computer and provisioned over USB;
+  locations appear in the fetch tool, never in Apple's Find My app. See
+  `firmware/OPENHAYSTACK.md`. **Not hardware-tested yet** — bench
+  verification still required.
 - **Transplant nozzle (recommended).** Cut the stem block + nozzle out of
   your stock actuator and epoxy it into the printed block — the stock
   orifice, sump, and stem fit are preserved, so the drug-delivery geometry
@@ -59,7 +66,7 @@ dose log dumps as CSV over serial.
 1. **Measure your can with calipers first** — valve stack height, stem
    length, can diameter. Those numbers are estimates in the CAD; the
    nozzle block is not tolerant of guesses. See `docs/build-notes.md` §4.
-2. **Print** — PETG recommended. `stl/puffpal-v4-combined.stl` lays all
+2. **Print** — PETG recommended. `cad/puffpal-v4-combined.stl` lays all
    parts out on one 202.5 × 97.5 mm plate. Print settings in
    `docs/build-notes.md`.
 3. **Transplant the nozzle** — cut the stem block out of your stock
@@ -71,15 +78,17 @@ dose log dumps as CSV over serial.
 6. **Validate before real use** — spray-pattern comparison against the
    stock actuator with an empty/water can first. See
    `docs/build-notes.md` §8.
+7. **Tracking (optional)** — generate keys and provision the OpenHaystack
+   beacon (see `firmware/OPENHAYSTACK.md` §4–§5); the screen shows
+   `FIND MY ON` once keys are loaded.
 
 ## What's inside
 
 | Path | What it is |
 |---|---|
-| `stl/` | All 14 v4 STLs (**ASCII** — every slicer reads them, and they diff on GitHub): 11 parts + folded/unfolded assemblies + combined print plate. All watertight, verified with trimesh. |
-| `cad/` | Parametric JSCAD source (`puffpal-v4.js`) + export + verification scripts. |
-| `firmware/` | PlatformIO + Arduino firmware for the XIAO nRF52840 + 1.54" e-ink, with a scripted 7-day dose-logic simulation (10/10 pass). |
-| `docs/` | `BOM.md` (Amazon-only parts list), `build-notes.md` (full build guide), `simulations.md` + scripts (battery, tolerance Monte Carlo, market, structural). |
+| `cad/` | All 14 v4 STLs (**ASCII** — every slicer reads them, and they diff on GitHub): 11 parts + folded/unfolded assemblies + combined print plate. All watertight, verified with trimesh. |
+| `firmware/` | PlatformIO + Arduino firmware for the XIAO nRF52840 + 1.54" e-ink, with a scripted 7-day dose-logic simulation (10/10 pass) + the OpenHaystack Find My beacon (`OPENHAYSTACK.md`, `tools/haystack_keys.py`). |
+| `docs/` | `BOM.md` (Amazon-only parts list), `build-notes.md` (full build guide). |
 | `images/` | SVG orthographic renders (folded + unfolded) — the images above. |
 | `LICENSE` | MIT. |
 
@@ -100,26 +109,15 @@ nRF52840, GxEPD2 driving the 1.54" e-ink. Deep sleep between events
 avatar faces + dose count + doses left on screen; button cycles
 today / 7-day bars / total; long-press + confirm resets for a new
 canister; dose log in flash, dumped as CSV over USB serial.
-**Compile-checked** (`pio run`: RAM 7.2%, Flash 12.9%) — **not
-hardware-tested**. No BLE and no Find My in this firmware (Apple MFi
-certification is the gate for a shipped product; a bench-only
-OpenHaystack-class proof is a later step). A scripted 7-day
+**Compile-checked** (`pio run`: RAM 8.2%, Flash 18.2%) — **not
+hardware-tested**. It also runs an **OpenHaystack Find My beacon**: a
+rotating P-224 public key advertised over BLE (1 s interval, key
+rotates every 15 min), keys provisioned over USB serial — see
+`firmware/OPENHAYSTACK.md` for setup, battery cost (~4.5 months
+beacon-on), and caveats. Locations appear in the fetch tool, never
+in Apple's Find My app. A scripted 7-day
 dose-logic simulation passes 10/10 cases (bounce, rapid presses,
 midnight rollover, reset) — see `firmware/sim/results.md`.
-
-## Simulations
-
-All scripted — scripts + raw outputs in `docs/simulations/`, full
-report in `docs/simulations.md`. Stated-assumption simulations, not
-forecasts and not measurements.
-
-| Sim | Headline |
-|---|---|
-| Battery (duty-cycle model) | ~**13 months** typical use with the as-built no-BLE firmware; ~**4.5 months** if Find My advertising (~20 µA) is added later. Sleep current dominates — measure it on the real board before trusting the months. |
-| Tolerance Monte Carlo (N=100,000) | Can in bore: P(jam) **0.000%**. Printed stem socket: 11% fail (8% too tight) — 41% too tight if FDM holes print 0.10 mm small. The quantitative case for the transplant variant as primary. |
-| Market re-run | Same model as the concept sim: Y1 base 8,000 units / $792k; v4 BOM $30.70 → break-even **3,431 units** (reached in base, missed in bear). |
-| Firmware logic | 10/10 cases pass — no double-counts, no missed doses. |
-| Structural (analytic hand-calcs, NOT FEA) | Press path comfortable (≥16× except nozzle screws 1.9×). Thinnest: hinge knuckle root **1.1× at a 15 N yank** (3.2× at a realistic 5 N fold) — cycle-test the hinge. |
 
 ## Status — what is NOT yet verified
 
@@ -137,6 +135,10 @@ forecasts and not measurements.
   empty/water can first; keep the stock actuator as backup for the
   first week.
 - **Hinge needs a 1,000-fold cycle test.** Drop/impact is unmodelled.
+- **Find My beacon is unproven on air.** The OpenHaystack beacon compiles
+  and the key/payload math checks out, but no Apple device has heard it
+  yet. Bench verification (scanner check, 15-min rotation, first report)
+  is still required — see `firmware/OPENHAYSTACK.md` §6.
 
 ## Safety
 

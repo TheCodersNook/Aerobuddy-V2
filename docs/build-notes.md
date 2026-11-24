@@ -106,11 +106,10 @@ exits a long edge instead, route it through the wire channel
 ## 4. Measurements to verify BEFORE printing the nozzle block
 
 These dimensions are **estimated** in the research file. Measure your own
-can with calipers and update the `P` parameters in `jscad/puffpal-v4.js`
-before printing either nozzle block. The rest of the body is tolerant of
+can with calipers before printing either nozzle block. The rest of the body is tolerant of
 ±0.5 mm; the nozzle block is not.
 
-| Parameter (in `P`) | Estimated value | What to measure on your can |
+| Dimension | Estimated value | What to measure on your can |
 |---|---|---|
 | `valve_stack_h` | 12.0 mm | Base of can → ferrule face (the valve stack height) |
 | `stem_protrusion` | 10.0 mm | Ferrule face → stem tip |
@@ -121,9 +120,12 @@ before printing either nozzle block. The rest of the body is tolerant of
 
 Also measure: the ferrule OD (assumed Ø20 — the relief is Ø20.5, so you
 have 0.25 mm/side), and your transplant cut (the pocket is 12×12×10 mm
-default — **measure your cut** and edit `transplant_x/y/z` if it differs).
-If any measured value differs by more than 0.5 mm from the estimate, change
-the parameter and re-export (`node export-v4.js`) — do not print and hope.
+default — **measure your cut**; if it differs, file the pocket or the
+block to fit).
+If any measured value differs by more than 0.5 mm from the estimate, do
+not print the nozzle block as-is — the socket/stem fit is not tolerant
+of guesses. The STLs here are fixed exports (no parametric source in
+this repo).
 
 ## 5. Usability audit (design audit — no user testing was done)
 
@@ -213,7 +215,7 @@ only — it creeps under the can's spring load and softens in heat.
 | Button cap | Hat down, stem up | 0.20 mm | 3 walls, 100% | None |
 | Hinge pin | **Use 27 mm of 1.75 mm filament instead** (cut flush). The printed pin is a backup — print it flat with a brim if you use it. | — | — | — |
 
-**Combined plate:** `stl/puffpal-v4-combined.stl` lays all parts out on a
+**Combined plate:** `cad/puffpal-v4-combined.stl` lays all parts out on a
 202.5 × 97.5 mm plate (fits a 220×220 mm bed), minimum inter-part gap
 2.50 mm (measured). Print time estimate: ~6–8 h at 0.20 mm (body dominates).
 Filament: ~80 g total (see §5 for the weight build-up).
@@ -330,8 +332,8 @@ is the variant to trust.
 
 ## 9. Verification (all geometry, no hardware yet)
 
-Run with `PYTHONPATH=/home/hatch/.local/lib/python3.12/site-packages
-python3 jscad/verify-v4.py` (needs trimesh + networkx + rtree):
+Verified before release with trimesh (watertight / void /
+hinge-sweep checks). Results:
 
 - **All 14 STLs watertight, 0 bad edges** (checked per shell).
 - **Folded bbox 50.0 × 94.0 × 38.0 mm** (1.97" × 3.70" × 1.50") —
@@ -339,9 +341,7 @@ python3 jscad/verify-v4.py` (needs trimesh + networkx + rtree):
 - **Void checks pass** (screen pocket, FPC channel, button pocket, can
   bore, cap bore, mouthpiece pocket, spray tunnel, nozzle pocket, bay,
   reed groove) — sampled grids, union semantics across the body's
-  overlapping shells. (Note: `trimesh.contains()` on the merged
-  multi-shell body mesh gives parity garbage — the verifier tests each
-  shell separately and ORs the results. Do not "simplify" that away.)
+  overlapping shells.
 - **Faceplate window clear** (no triangles inside the window rect) and
   the button/LED hole gap is solid.
 - **Hinge sweep collision-free at 0–90°** in 5° steps (mouthpiece
@@ -365,19 +365,22 @@ python3 jscad/verify-v4.py` (needs trimesh + networkx + rtree):
 - **Battery life.** Depends on the board's real sleep current (see the BOM
   warning — the SuperMini's sleep current is disputed). Measure it, do not
   assume it.
-- **Find My.** Not implemented (see report 13 §1.2 for the MFi gate).
+- **Find My (OpenHaystack).** Implemented in firmware and compile-checked,
+  but no Apple device has heard it advertise yet — bench verification
+  (scanner check, 15-min rotation, first report) is still required. See
+  `firmware/OPENHAYSTACK.md` §6. Unofficial DIY route, not MFi; locations
+  appear in the fetch tool, never in Apple's Find My app.
 - **Usability.** The §5 audit is a design audit from the CAD. No one has
   held the device; the weight, the one-handed unfold, and the no-detent
   mouthpiece are the things most likely to annoy in real use.
 
 ## 11. Files
 
-- `jscad/puffpal-v4.js` — parametric source (all dimensions in `P`)
-- `jscad/export-v4.js` — exports all STLs (`node export-v4.js`)
-- `jscad/verify-v4.py` — watertight / void / hinge-sweep checks (see §9)
-- `jscad/checks.js` — exports body shells + mouthpiece separately
-- `stl/` — 11 individual parts + 2 assemblies + combined plate (14 files)
-- `renders/` — folded + unfolded PNG previews (`render.py`) and
-  three-view SVG orthographic renders (`render_svg.py`)
-- `puffpal-v4-bom.md` — Amazon-only BOM, parts only, exact search terms
-- `README.md` — regeneration instructions
+- `cad/` — 14 STLs: 11 individual parts + folded/unfolded assemblies + combined print plate
+- `images/` — folded + unfolded three-view SVG orthographic renders
+- `docs/BOM.md` — Amazon-only BOM, parts only, exact search terms
+- `docs/build-notes.md` — this file
+- `firmware/` — PlatformIO + Arduino firmware (XIAO nRF52840 + 1.54" e-ink),
+  incl. the OpenHaystack beacon (`OPENHAYSTACK.md`, `tools/haystack_keys.py`)
+- `README.md` — project overview
+- `LICENSE` — MIT

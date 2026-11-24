@@ -7,7 +7,8 @@
 Real, compile-checked PlatformIO + Arduino firmware for the folding
 replacement actuator: Seeed XIAO nRF52840 + 1.54" 200×200 e-ink panel
 (GDEH0154D67 class, GxEPD2). Dose tracing on-device, avatar face, **no
-companion app, no BLE, no Find My** in this firmware.
+companion app** — plus an **OpenHaystack Find My beacon** (DIY tracking,
+no MFi — see `OPENHAYSTACK.md`).
 
 **Status: compile-checked only — NOT hardware-tested.** Bench tests in §5
 are the proof that still has to happen on the real board.
@@ -30,6 +31,14 @@ are the proof that still has to happen on the real board.
 - **USB serial (115200):** auto-dumps the dose log as CSV on connect.
   Commands: `LOG` (dump), `STATUS`, `RESET` (new canister),
   `SETTIME <unix epoch>` (sets the clock — see §6), `HELP`.
+- **OpenHaystack Find My beacon:** broadcasts a rotating P-224 public
+  key as an Apple Offline Finding advertisement (1 s interval, +4 dBm,
+  key rotates every 15 min). Keys are provisioned over USB serial
+  (`HAYSTACK_PUT`, `HAYSTACK_ON`/`OFF`, `HAYSTACK_STATUS` —
+  see `OPENHAYSTACK.md`); the beacon auto-starts at boot once keys
+  exist, and the main screen shows "FIND MY ON" while it advertises.
+  Battery cost ≈ +20 µA average → ~4.5 months on the 110 mAh cell
+  (vs ~13 months with the beacon off). Not hardware-tested.
 - **Persistence:** counter + log in internal flash (LittleFS, Adafruit
   core). Log line: `day,ms_in_day,boot,doses_left`. Rotates at 1000 lines.
 
@@ -109,6 +118,15 @@ core), install the GxEPD2 library, open `src/main.cpp` as a sketch.
    3 s and wait 10 s → cancels, count unchanged.
 6. **Spray-pattern validation** (v3 build notes §7) still applies —
    the firmware counts presses, it does not validate the drug path.
+7. **Beacon (needs keys provisioned first — see `OPENHAYSTACK.md`):**
+   after provisioning, the screen shows "FIND MY ON"; `HAYSTACK_STATUS`
+   over serial prints the BLE address + full payload. With a BLE
+   scanner app (nRF Connect / LightBlue), look for an advert whose
+   manufacturer data starts `4C 00 12 19` — that is the Find My frame.
+   Leave it advertising 15 min and confirm the key (and address)
+   change; then confirm a location report appears in your fetch tool
+   (macless-haystack web UI / FindMy.py) — first reports can take
+   minutes to hours depending on nearby Apple devices.
 
 ## 6. Honest limits
 
@@ -126,10 +144,15 @@ core), install the GxEPD2 library, open `src/main.cpp` as a sketch.
   comfortably under the 30 µA target, but measure it (test 2). If it
   measures high, the fallback is SYSTEMOFF (loses the clock; day
   counter would need rethinking).
-- **Find My is not here.** Apple MFi certification is the gate
-  (report 13 §1.2, +$50k for a shipped product). A bench-only
-  OpenHaystack-class proof is a separate later step. No BLE
-  advertising in this firmware at all.
+- **Find My is OpenHaystack, not MFi.** Apple MFi certification is
+  the gate for a *shipped* product (+$50k and Apple's approval process). This
+  firmware uses the unofficial DIY route instead: it impersonates an
+  AirTag's advertisement with your own keys. Apple could break it,
+  locations do NOT appear in Apple's Find My app (they appear in the
+  fetch tool's own map — see `OPENHAYSTACK.md`), and there is no
+  anti-stalking chirp, so iPhones near it may show "unknown accessory"
+  alerts. Bench prototype only — see `OPENHAYSTACK.md` §8 for the
+  full caveat list.
 - **E-ink BUSY polarity assumed HIGH = busy** (GDEH0154D67 standard).
   If the panel never refreshes, check BUSY with a meter first.
 - **No mass-storage CSV.** Serial dump only in v1 (v3 build notes §6
@@ -139,6 +162,10 @@ core), install the GxEPD2 library, open `src/main.cpp` as a sketch.
 
 - `platformio.ini` — board, framework, GxEPD2 dependency
 - `src/main.cpp` — the whole firmware (pins, sleep, debounce, UI,
-  LittleFS log, serial commands)
+  LittleFS log, serial commands, OpenHaystack beacon)
 - `sim/dose_logic_sim.py` — scripted 7-day logic simulation (mirrors
   the firmware state machine; see `sim/results.md`, 10/10 cases pass)
+- `OPENHAYSTACK.md` — Find My beacon: protocol, key generation,
+  provisioning, retrieval, battery math, caveats
+- `tools/haystack_keys.py` — key generation + USB provisioning script
+  (P-224 keypairs, 0600 private-key store, serial upload)

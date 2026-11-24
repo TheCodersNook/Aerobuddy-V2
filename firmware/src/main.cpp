@@ -21,8 +21,14 @@
 //   * USB serial: auto-dumps the dose log as CSV on connect; commands
 //     LOG / STATUS / RESET / SETTIME <unix epoch> / HELP.
 //   * Counter + log persist in internal flash (LittleFS, Adafruit core).
-//   * Find My is NOT in this firmware (Apple MFi gate — README).
-//     No BLE advertising in v1.
+//   * OpenHaystack Find My beacon (v2 addition): broadcasts a rotating
+//     P-224 public key as an Apple Offline Finding advertisement, so
+//     nearby Apple devices file encrypted location reports you decrypt
+//     with the matching private keys (see OPENHAYSTACK.md). No MFi,
+//     no Apple approval — unofficial DIY tracking. Keys are provisioned
+//     over USB serial (HAYSTACK_PUT) and stored in LittleFS; the beacon
+//     auto-starts at boot once keys exist. The advert is non-connectable
+//     and there is no companion app — nothing to pair to.
 //
 // Honest limits (see README for all of them):
 //   * No RTC hardware: the day counter is days since first power-on
@@ -30,6 +36,11 @@
 //     until then; "midnight" is 24 h after first boot.
 //   * millis() wraps at ~49.7 days; the day index restarts then.
 //   * NOT hardware-tested. Compile-checked only. Bench tests in README.
+//   * The beacon is NOT hardware-tested either: the payload bytes and
+//     address derivation follow OpenHaystack / PETS 2021 exactly, but
+//     no Apple device has ever heard this firmware advertise. Bench
+//     test 7 in README + OPENHAYSTACK.md section 6 are the proof that
+//     still has to happen on the real board.
 //
 // Wiring (must match the README table exactly):
 //   E-ink (SPI, default XIAO SPI: SCK D8, MISO D9, MOSI D10)
@@ -46,6 +57,7 @@
 #include <Fonts/FreeSans9pt7b.h>
 #include <Adafruit_LittleFS.h>
 #include <InternalFileSystem.h>
+#include <bluefruit.h>  // Adafruit Bluefruit52Lib (bundled in the nRF52 core): BLE advertising + SoftDevice access for the OpenHaystack beacon
 
 using namespace Adafruit_LittleFS_Namespace;
 
@@ -180,6 +192,234 @@ static void dailyCounts(int32_t today, uint16_t out[7]) {
   f.close();
 }
 
+// ------------------------------------------------------- OpenHaystack
+// DIY Find My tracking (v2 addition). How it works, in one paragraph:
+// the beacon broadcasts a 28-byte NIST P-224 public key, split across
+// the BLE random address (first 6 bytes) and the advertisement payload
+// (the other 22 bytes), in Apple's Offline Finding format. Any nearby
+// Apple device that hears it encrypts its own GPS fix to that public
+// key (ECIES) and uploads the ciphertext to Apple, indexed by
+// SHA-256(public key). Only the holder of the matching private key can
+// decrypt the report — that is the whole security model, and it is why
+// the private keys NEVER go on this device: only public keys are
+// provisioned here (over USB serial, HAYSTACK_PUT). Key generation,
+// provisioning, and report retrieval: see OPENHAYSTACK.md.
+//
+// Protocol references (the byte layout below follows these exactly):
+//   * Heinrich, Stute, Kornhuber & Hollick, "Who Can Find My Devices?",
+//     PoPETs/PETS 2021 (SEEMOO lab) — the OpenHaystack paper.
+//   * seemoo-lab/openhaystack (2021) + dchristl/macless-haystack —
+//     the reference firmwares (ESP32 + nRF5x) this mirrors.
+//   * Apple company ID 0x004C, Offline Finding type 0x12.
+//
+// Rotation: Apple rotates keys every 15 min; this firmware does the
+// same (HAYSTACK_ROTATE_MS). The key index follows wall-clock 15-min
+// slots when the clock is set (SETTIME), else 15-min slots since boot.
+// The owner's fetch tooling queries ALL provisioned keys, so either
+// alignment works — rotation is for unlinkability, not correctness.
+//
+// NOT hardware-tested: no Apple device has heard this firmware
+// advertise. The payload bytes, address derivation, and rotation flow
+// are the same as the known-good nRF5x OpenHaystack firmwares, but
+// bench test 7 (README) + OPENHAYSTACK.md section 6 are the proof
+// that has to happen on the real board.
+
+#define HAYSTACK_KEY_BYTES  28      // P-224 public-key X-coordinate
+#define HAYSTACK_MAX_KEYS   1024    // 28 KB; the XIAO has 2 MB QSPI flash
+#define HAYSTACK_ROTATE_MS  900000UL// 15 min, Apple's rotation interval
+#define HAYSTACK_ADV_MS     1000    // advertising interval (1 s)
+#define HAYSTACK_TX_POWER   4       // dBm (+4: better find range; ~+4 uA avg vs 0 dBm)
+#define HAYSTACK_FILE       "/haystack.bin"
+// File layout: 8-byte header + count*28-byte keys.
+//   header: "HSTK" magic, version=1, enabled (0/1), count u16 LE.
+#define HAYSTACK_HDR_LEN    8
+#define HAYSTACK_MAGIC      "HSTK"
+
+static uint16_t g_hsCount = 0;       // keys provisioned (0 = no beacon)
+static bool     g_hsEnabled = true;  // persisted on/off preference
+static bool     g_hsRunning = false; // advertising right now
+static bool     g_hsBleUp = false;   // Bluefruit.begin() done
+static uint16_t g_hsIndex = 0xFFFF;  // current key index (0xFFFF = none)
+static bool     g_uiDirty = false;   // screen needs a refresh (beacon state changed)
+static uint32_t g_hsLastTryMs = 0;   // backoff timer for failed beacon starts
+
+static bool haystackLoadHeader() {
+  File f = InternalFS.open(HAYSTACK_FILE, FILE_O_READ);
+  if (!f) { g_hsCount = 0; g_hsEnabled = true; return false; }
+  uint8_t hdr[HAYSTACK_HDR_LEN];
+  int n = f.read(hdr, sizeof(hdr));
+  f.close();
+  if (n != HAYSTACK_HDR_LEN || memcmp(hdr, HAYSTACK_MAGIC, 4) != 0 ||
+      hdr[4] != 1) {
+    g_hsCount = 0; g_hsEnabled = true;
+    return false;
+  }
+  g_hsEnabled = (hdr[5] != 0);
+  g_hsCount = (uint16_t)hdr[6] | ((uint16_t)hdr[7] << 8);
+  if (g_hsCount > HAYSTACK_MAX_KEYS) g_hsCount = HAYSTACK_MAX_KEYS;
+  return true;
+}
+static bool haystackSaveHeader() {
+  File f = InternalFS.open(HAYSTACK_FILE, FILE_O_WRITE);
+  if (!f) return false;
+  uint8_t hdr[HAYSTACK_HDR_LEN] = { 'H', 'S', 'T', 'K', 1,
+    (uint8_t)(g_hsEnabled ? 1 : 0),
+    (uint8_t)(g_hsCount & 0xFF), (uint8_t)(g_hsCount >> 8) };
+  f.seek(0);
+  size_t w = f.write(hdr, sizeof(hdr));
+  f.close();
+  return w == sizeof(hdr);
+}
+static bool haystackReadKey(uint16_t index, uint8_t key[HAYSTACK_KEY_BYTES]) {
+  if (index >= g_hsCount) return false;
+  File f = InternalFS.open(HAYSTACK_FILE, FILE_O_READ);
+  if (!f) return false;
+  if (!f.seek(HAYSTACK_HDR_LEN + (uint32_t)index * HAYSTACK_KEY_BYTES)) { f.close(); return false; }
+  int n = f.read(key, HAYSTACK_KEY_BYTES);
+  f.close();
+  return n == HAYSTACK_KEY_BYTES;
+}
+static bool haystackKeyIsZero(const uint8_t key[HAYSTACK_KEY_BYTES]) {
+  for (int i = 0; i < HAYSTACK_KEY_BYTES; i++) if (key[i]) return false;
+  return true;
+}
+static bool haystackPutKey(uint16_t index, const uint8_t key[HAYSTACK_KEY_BYTES]) {
+  // Sequential provisioning only: no gaps (a gap would be a zero key,
+  // which is not a valid public key and would break rotation).
+  if (index > g_hsCount || index >= HAYSTACK_MAX_KEYS) return false;
+  if (haystackKeyIsZero(key)) return false;
+  // First key (or a fresh/corrupt file): make sure a valid header exists.
+  if (g_hsCount == 0 && !haystackSaveHeader()) return false;
+  File f = InternalFS.open(HAYSTACK_FILE, FILE_O_WRITE);
+  if (!f) return false;
+  if (!f.seek(HAYSTACK_HDR_LEN + (uint32_t)index * HAYSTACK_KEY_BYTES)) { f.close(); return false; }
+  size_t w = f.write(key, HAYSTACK_KEY_BYTES);
+  f.close();
+  if (w != HAYSTACK_KEY_BYTES) return false;
+  if (index >= g_hsCount) { g_hsCount = index + 1; haystackSaveHeader(); }
+  return true;
+}
+static void haystackStopBeacon() {
+  if (g_hsRunning) Bluefruit.Advertising.stop();
+  g_hsRunning = false;
+  g_hsIndex = 0xFFFF;
+}
+static void haystackClear() {
+  haystackStopBeacon();
+  InternalFS.remove(HAYSTACK_FILE);
+  g_hsCount = 0; g_hsEnabled = true; g_hsIndex = 0xFFFF;
+}
+// Build the 29-byte manufacturer-specific payload (the AD element's
+// data — Bluefruit adds the length byte + 0xFF type byte):
+//   [0..1]  4C 00  Apple company ID (little-endian)
+//   [2]     12     Offline Finding type
+//   [3]     19     payload length (25 bytes follow)
+//   [4]     00     status byte (battery unknown, not separated;
+//                  both reference firmwares use 0x00; bits 6-7 can
+//                  carry battery level later — see macless-haystack
+//                  firmware/nrf5x/battery.h)
+//   [5..26] key[6..27]  (22 bytes — the middle of the public key)
+//   [27]    key[0] >> 6 (top 2 bits of key[0], lost from the address)
+//   [28]    00     hint byte (unused)
+// The finder rebuilds the full 28-byte key as:
+//   key[0] = (payload[27] << 6) | (addr[0] & 0x3F),
+//   key[1..5] = addr[1..5], key[6..27] = payload[5..26].
+static void haystackBuildPayload(const uint8_t key[HAYSTACK_KEY_BYTES], uint8_t out[29]) {
+  out[0] = 0x4C; out[1] = 0x00;
+  out[2] = 0x12; out[3] = 0x19;
+  out[4] = 0x00;
+  memcpy(out + 5, key + 6, 22);
+  out[27] = (uint8_t)(key[0] >> 6);
+  out[28] = 0x00;
+}
+static bool haystackStartBeacon(uint16_t index) {
+  uint8_t key[HAYSTACK_KEY_BYTES];
+  if (!haystackReadKey(index, key)) return false;
+  if (haystackKeyIsZero(key)) return false;
+  if (!g_hsBleUp) {
+    Bluefruit.autoConnLed(false);  // no blinking LED while advertising
+    Bluefruit.begin();
+    Bluefruit.setTxPower(HAYSTACK_TX_POWER);
+    Bluefruit.Advertising.setType(BLE_GAP_ADV_TYPE_NONCONNECTABLE_NONSCANNABLE_UNDIRECTED);
+    Bluefruit.Advertising.setIntervalMS(HAYSTACK_ADV_MS, HAYSTACK_ADV_MS);
+    g_hsBleUp = true;
+  }
+  // The BLE address MUST carry the key's first 6 bytes (the finder
+  // rebuilds the public key from address + payload). The SoftDevice
+  // forbids changing the identity address while advertising, so stop
+  // first; setAddr is retried because the stop completes async.
+  if (g_hsRunning) Bluefruit.Advertising.stop();
+  ble_gap_addr_t addr;
+  addr.addr_type = BLE_GAP_ADDR_TYPE_RANDOM_STATIC;
+  addr.addr[0] = (uint8_t)(key[0] | 0xC0);  // top 2 bits = 0b11 (random static)
+  for (int i = 1; i < 6; i++) addr.addr[i] = key[i];
+  bool ok = false;
+  for (int i = 0; i < 20 && !ok; i++) {
+    ok = Bluefruit.setAddr(&addr);
+    if (!ok) delay(10);
+  }
+  if (!ok) { g_hsRunning = false; return false; }
+  uint8_t payload[29];
+  haystackBuildPayload(key, payload);
+  Bluefruit.Advertising.clearData();
+  if (!Bluefruit.Advertising.addData(BLE_GAP_AD_TYPE_MANUFACTURER_SPECIFIC_DATA, payload, sizeof(payload))) {
+    g_hsRunning = false; return false;
+  }
+  if (!Bluefruit.Advertising.start(0)) {  // 0 = advertise forever
+    g_hsRunning = false; return false;
+  }
+  g_hsRunning = true;
+  g_hsIndex = index;
+  return true;
+}
+static uint16_t haystackDesiredIndex(uint32_t nowMs) {
+  if (g_hsCount == 0) return 0xFFFF;
+  uint32_t slot;
+  if (g_timeSet) slot = nowUnixSec(nowMs) / 900UL;   // wall-clock 15-min slots
+  else           slot = nowMs / HAYSTACK_ROTATE_MS;  // boot-relative slots
+  return (uint16_t)(slot % g_hsCount);
+}
+// Called every loop iteration: start the beacon when keys exist, rotate
+// the key every 15 min, stop it when disabled. Cheap (one division);
+// the actual re-advertise only happens on an index change.
+static void haystackPoll(uint32_t nowMs) {
+  if (g_hsCount == 0 || !g_hsEnabled) {
+    if (g_hsRunning) haystackStopBeacon();
+    return;
+  }
+  uint16_t want = haystackDesiredIndex(nowMs);
+  if (g_hsRunning && want == g_hsIndex) return;
+  // Don't hammer a failing start: one attempt per 5 s. (A failed
+  // rotation leaves the beacon dark until the next attempt — a few
+  // seconds of no beacon, acceptable for a bench prototype.)
+  if (nowMs - g_hsLastTryMs < 5000UL) return;
+  g_hsLastTryMs = nowMs;
+  bool was = g_hsRunning;
+  if (haystackStartBeacon(want) && !was) g_uiDirty = true;  // first start -> show indicator
+}
+static int haystackHexVal(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+// Decode exactly 56 hex chars into 28 bytes. Returns false on any bad char.
+static bool haystackHexToKey(const char *hex, uint8_t key[HAYSTACK_KEY_BYTES]) {
+  for (int i = 0; i < HAYSTACK_KEY_BYTES; i++) {
+    int hi = haystackHexVal(hex[2*i]), lo = haystackHexVal(hex[2*i+1]);
+    if (hi < 0 || lo < 0) return false;
+    key[i] = (uint8_t)((hi << 4) | lo);
+  }
+  return true;
+}
+static void haystackPrintHex(const uint8_t *buf, uint8_t len) {
+  const char *h = "0123456789abcdef";
+  for (int i = 0; i < len; i++) {
+    Serial.write(h[buf[i] >> 4]);
+    Serial.write(h[buf[i] & 0x0F]);
+  }
+}
+
 // -------------------------------------------------------------- serial
 static void dumpCsvOverSerial() {
   Serial.println("day,ms_in_day,boot,doses_left");
@@ -200,6 +440,7 @@ static void dumpCsvOverSerial() {
   }
   Serial.println("# --- end of log ---");
   Serial.println("# Commands: LOG, STATUS, RESET, SETTIME <unix>, HELP");
+  Serial.println("# Haystack: HAYSTACK_PUT <idx> <56 hex>, HAYSTACK_COUNT, HAYSTACK_STATUS, HAYSTACK_ON, HAYSTACK_OFF, HAYSTACK_CLEAR");
 }
 static void printStatus() {
   uint32_t now = millis();
@@ -213,13 +454,18 @@ static void printStatus() {
     Serial.print("unix_now="); Serial.println(nowUnixSec(now));
   }
   Serial.print("uptime_ms="); Serial.println(now);
+  Serial.print("haystack_keys="); Serial.println(g_hsCount);
+  Serial.print("haystack_beacon="); Serial.println(g_hsRunning ? "on" : "off");
+  if (g_hsRunning) {
+    Serial.print("haystack_key_index="); Serial.println(g_hsIndex);
+  }
 }
 static void doResetCanister() {
   g_dosesLeft = DOSES_PER_CAN;
   g_canisters++;
   saveState();
 }
-static char g_cmdBuf[32];
+static char g_cmdBuf[96];  // 96: HAYSTACK_PUT lines carry a 56-char hex key
 static uint8_t g_cmdLen = 0;
 static void handleSerialLine(const char *line);
 static void pollSerial() {
@@ -255,6 +501,86 @@ static void handleSerialLine(const char *line) {
     }
   } else if (!strcasecmp(line, "HELP")) {
     Serial.println("LOG, STATUS, RESET, SETTIME <unix>, HELP");
+    Serial.println("HAYSTACK_PUT <idx> <56 hex>, HAYSTACK_COUNT, HAYSTACK_STATUS, HAYSTACK_ON, HAYSTACK_OFF, HAYSTACK_CLEAR");
+  } else if (!strncasecmp(line, "HAYSTACK_PUT ", 13)) {
+    // HAYSTACK_PUT <index> <56 hex chars> — store one public key.
+    const char *p = line + 13;
+    char *end = NULL;
+    long idx = strtol(p, &end, 10);
+    if (end == p || *end != ' ') {
+      Serial.println("ERR usage: HAYSTACK_PUT <index> <56 hex>");
+    } else if (strlen(end + 1) != 56) {
+      Serial.println("ERR key must be exactly 56 hex chars (28 bytes)");
+    } else if (idx < 0 || idx >= HAYSTACK_MAX_KEYS) {
+      Serial.println("ERR index out of range");
+    } else {
+      uint8_t key[HAYSTACK_KEY_BYTES];
+      if (!haystackHexToKey(end + 1, key)) {
+        Serial.println("ERR key is not valid hex");
+      } else if (!haystackPutKey((uint16_t)idx, key)) {
+        Serial.println("ERR store failed (provision in order from 0, no gaps; key must not be all zero)");
+      } else {
+        Serial.print("OK key "); Serial.print(idx);
+        Serial.print(" stored ("); Serial.print(g_hsCount); Serial.println(" total)");
+        if (g_hsCount == 1 && g_hsEnabled) {
+          // First key: the beacon can start now.
+          if (haystackStartBeacon(haystackDesiredIndex(millis()))) g_uiDirty = true;
+        }
+      }
+    }
+  } else if (!strcasecmp(line, "HAYSTACK_COUNT")) {
+    Serial.print("keys="); Serial.println(g_hsCount);
+    Serial.print("enabled="); Serial.println(g_hsEnabled ? "yes" : "no");
+    Serial.print("advertising="); Serial.println(g_hsRunning ? "yes" : "no");
+    Serial.print("key_index=");
+    Serial.println(g_hsIndex == 0xFFFF ? -1 : (int)g_hsIndex);
+  } else if (!strcasecmp(line, "HAYSTACK_STATUS")) {
+    // COUNT + the current address + payload, so you can verify the
+    // beacon with a BLE scanner app (nRF Connect / LightBlue).
+    Serial.print("keys="); Serial.println(g_hsCount);
+    Serial.print("enabled="); Serial.println(g_hsEnabled ? "yes" : "no");
+    Serial.print("advertising="); Serial.println(g_hsRunning ? "yes" : "no");
+    if (g_hsBleUp) {
+      ble_gap_addr_t a = Bluefruit.getAddr();
+      Serial.print("ble_addr=");
+      for (int i = 5; i >= 0; i--) {  // MSB first, as scanners display it
+        if (a.addr[i] < 0x10) Serial.print("0");
+        Serial.print(a.addr[i], HEX);
+        if (i > 0) Serial.print(":");
+      }
+      Serial.println();
+    } else {
+      Serial.println("ble_addr=(ble not started)");
+    }
+    if (g_hsRunning && g_hsIndex != 0xFFFF) {
+      uint8_t key[HAYSTACK_KEY_BYTES];
+      if (haystackReadKey(g_hsIndex, key)) {
+        uint8_t payload[29];
+        haystackBuildPayload(key, payload);
+        Serial.print("key_index="); Serial.println(g_hsIndex);
+        // Full on-air AD element: 1E (length) FF (manufacturer type)
+        // + the 29 payload bytes. A scanner should show manufacturer
+        // data starting 4C 00 12 19.
+        Serial.print("payload=1eff");
+        haystackPrintHex(payload, sizeof(payload));
+        Serial.println();
+      }
+    }
+  } else if (!strcasecmp(line, "HAYSTACK_ON")) {
+    g_hsEnabled = true; haystackSaveHeader();
+    if (g_hsCount > 0) {
+      if (haystackStartBeacon(haystackDesiredIndex(millis()))) g_uiDirty = true;
+      Serial.println("Beacon on.");
+    } else {
+      Serial.println("Beacon enabled, but no keys provisioned yet (HAYSTACK_PUT).");
+    }
+  } else if (!strcasecmp(line, "HAYSTACK_OFF")) {
+    g_hsEnabled = false; haystackSaveHeader();
+    haystackStopBeacon(); g_uiDirty = true;
+    Serial.println("Beacon off.");
+  } else if (!strcasecmp(line, "HAYSTACK_CLEAR")) {
+    haystackClear(); g_uiDirty = true;
+    Serial.println("All Haystack keys erased. Beacon stopped.");
   } else {
     Serial.print("Unknown command: ");
     Serial.println(line);
@@ -323,6 +649,7 @@ static void showMain(uint32_t nowMs) {
   refreshBegin();
   do {
     display.fillScreen(GxEPD_WHITE);
+    if (g_hsRunning) centeredText("FIND MY ON", 14, &FreeSans9pt7b);
     drawAvatar(100, 62, faceForNow(nowMs));
     char buf[24];
     if (g_dosesLeft == 0) centeredText("EMPTY", 128, &FreeSansBold12pt7b);
@@ -488,6 +815,12 @@ void setup() {
   while (!Serial && millis() - t0 < 3000) delay(10);
   if (Serial) { dumpCsvOverSerial(); g_usbDumped = true; g_serialWasUp = true; }
 
+  // OpenHaystack beacon: auto-starts if keys were provisioned earlier.
+  haystackLoadHeader();
+  if (g_hsCount > 0 && g_hsEnabled) {
+    haystackStartBeacon(haystackDesiredIndex(millis()));
+  }
+
   showMain(millis());
 }
 
@@ -530,6 +863,14 @@ void loop() {
   if (!serialUp) g_usbDumped = false;
   g_serialWasUp = serialUp;
   if (serialUp) pollSerial();
+
+  // OpenHaystack: start the beacon when keys exist, rotate the key
+  // every 15 min, stop it when disabled. When the beacon is running,
+  // the SoftDevice's radio events wake the CPU from WFI about once a
+  // second, so rotation stays on schedule even with no button/reed
+  // activity. When unprovisioned this is one cheap division.
+  haystackPoll(now);
+  if (g_uiDirty && g_view == 0) { g_uiDirty = false; showMain(millis()); }
 
   // Sleep: WFI halts the CPU until the next interrupt (reed/button
   // GPIOTE, or USB). The RTC keeps millis() running, so timestamps,
