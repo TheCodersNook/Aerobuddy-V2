@@ -1,4 +1,10 @@
-// AeroBuddy v2 firmware (developed as PuffPal v4; Nov 23, 2026)
+// AeroBuddy v5 firmware (v4 lineage: PuffPal v4 / AeroBuddy v2; Nov 23, 2026)
+//
+// v5 hardware change vs v4: dose detection is a microswitch under the
+// press cap (closes at the bottom of the ~3.2 mm fire stroke). Same
+// D6 pin, same falling-edge interrupt, same 400 ms debounce — the
+// dose logic is unchanged. Battery is unchanged: 301230 LiPo on the
+// XIAO's battery pads, charged over USB-C.
 //
 // Folding replacement actuator for an albuterol inhaler: on-device dose
 // tracing, 1.54" e-ink screen with an avatar face, NO companion app.
@@ -11,7 +17,8 @@
 //     millis() running across sleeps, so the debounce window, the dose
 //     timestamps, and the day counter all survive sleep. (SYSTEMOFF
 //     would draw less but kills the clock — see README for the tradeoff.)
-//   * Reed close (canister pressed) -> GPIO interrupt wakes the CPU;
+//   * Microswitch close (press cap bottoms out at the end of the
+//     ~3.2 mm fire stroke) -> GPIO interrupt wakes the CPU;
 //     one dose counted per press. Debounce: presses <400 ms apart count
 //     as one (bounce bursts and double-triggers are ignored by timestamp).
 //   * E-ink UI: avatar face (happy / sleepy / concerned / empty), doses
@@ -45,9 +52,10 @@
 // Wiring (must match the README table exactly):
 //   E-ink (SPI, default XIAO SPI: SCK D8, MISO D9, MOSI D10)
 //     CS=D2  DC=D3  RST=D1  BUSY=D0
-//   Reed switch (NO, to GND): D6    Button (to GND): D7
+//   Microswitch (NO, to GND, under the press cap): D6    Button (to GND): D7
 //   LED anode (via 220 ohm to GND): D4
-//   LiPo 301230 to the XIAO's battery pads; USB-C is the XIAO's own port.
+//   LiPo 301230 to the XIAO's battery pads; USB-C is the XIAO's own port
+//   (charges the LiPo + data/flashing).
 
 #include <Arduino.h>
 #include <SPI.h>
@@ -66,7 +74,7 @@ using namespace Adafruit_LittleFS_Namespace;
 #define EPD_DC    3   // D3
 #define EPD_RST   1   // D1
 #define EPD_BUSY  0   // D0 — GDEH0154D67 BUSY is HIGH while busy
-#define REED_PIN  6   // D6, INPUT_PULLUP, LOW = canister pressed
+#define SWITCH_PIN  6   // D6, INPUT_PULLUP, LOW = press cap bottomed out
 #define BTN_PIN   7   // D7, INPUT_PULLUP, LOW = pressed
 #define LED_PIN   4   // D4, HIGH = LED on (via 220 ohm to GND)
 
@@ -97,10 +105,10 @@ static uint8_t  g_view = 0;          // 0 main, 1 today, 2 week, 3 total
 static bool     g_confirmPending = false;
 static uint32_t g_confirmSinceMs = 0;
 
-static volatile bool g_reedEvent = false;
+static volatile bool g_switchEvent = false;
 static volatile bool g_btnEvent = false;
 
-static void reedISR() { g_reedEvent = true; }
+static void switchISR() { g_switchEvent = true; }
 static void btnISR()  { g_btnEvent = true; }
 
 // ------------------------------------------------------------- time
@@ -760,7 +768,7 @@ static void countDose(uint32_t nowMs) {
   g_view = 0;  // a puff always returns to the main screen
   showMain(nowMs);
 }
-static void onReedEvent(uint32_t nowMs) {
+static void onSwitchEvent(uint32_t nowMs) {
   // Timestamp debounce: bounce bursts and double-triggers inside the
   // 400 ms window count as the same press. A real second puff is a
   // full press-release-press cycle (~1 s), well outside the window.
@@ -791,7 +799,7 @@ static bool g_usbDumped = false;
 static bool g_serialWasUp = false;
 
 void setup() {
-  pinMode(REED_PIN, INPUT_PULLUP);
+  pinMode(SWITCH_PIN, INPUT_PULLUP);
   pinMode(BTN_PIN, INPUT_PULLUP);
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
@@ -803,12 +811,12 @@ void setup() {
   g_boots++;
   saveState();
 
-  attachInterrupt(digitalPinToInterrupt(REED_PIN), reedISR, FALLING);
+  attachInterrupt(digitalPinToInterrupt(SWITCH_PIN), switchISR, FALLING);
   attachInterrupt(digitalPinToInterrupt(BTN_PIN), btnISR, FALLING);
 
   // If we booted with the canister already pressed, count it (a press
   // that happened during a dead-battery boot is still a dose).
-  if (digitalRead(REED_PIN) == LOW) onReedEvent(millis());
+  if (digitalRead(SWITCH_PIN) == LOW) onSwitchEvent(millis());
 
   Serial.begin(115200);
   uint32_t t0 = millis();
@@ -834,7 +842,7 @@ static bool     g_longFired = false;
 void loop() {
   uint32_t now = millis();
 
-  if (g_reedEvent) { g_reedEvent = false; onReedEvent(now); now = millis(); }
+  if (g_switchEvent) { g_switchEvent = false; onSwitchEvent(now); now = millis(); }
 
   bool btnLow = (digitalRead(BTN_PIN) == LOW);
   if (btnLow && !g_btnDown) {
@@ -867,12 +875,12 @@ void loop() {
   // OpenHaystack: start the beacon when keys exist, rotate the key
   // every 15 min, stop it when disabled. When the beacon is running,
   // the SoftDevice's radio events wake the CPU from WFI about once a
-  // second, so rotation stays on schedule even with no button/reed
+  // second, so rotation stays on schedule even with no button/switch
   // activity. When unprovisioned this is one cheap division.
   haystackPoll(now);
   if (g_uiDirty && g_view == 0) { g_uiDirty = false; showMain(millis()); }
 
-  // Sleep: WFI halts the CPU until the next interrupt (reed/button
+  // Sleep: WFI halts the CPU until the next interrupt (switch/button
   // GPIOTE, or USB). The RTC keeps millis() running, so timestamps,
   // debounce, and the day counter all survive sleep. While USB is
   // connected we stay awake to serve serial (USB-powered anyway);

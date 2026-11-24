@@ -1,8 +1,10 @@
-# AeroBuddy v2 — Firmware
+# AeroBuddy v5 — Firmware
 
-> The design was developed as PuffPal (v3 hardware / v4 firmware lineage);
-> AeroBuddy v2 is the new name. Internal file names still say `puffpal` —
-> only the user-facing title changed.
+> v5 firmware lineage: PuffPal v4 / AeroBuddy v2. The v5 change vs v4
+> is dose detection: a microswitch under the press cap (same D6 pin,
+> same interrupt + debounce). Battery, UI, beacon, and logging are
+> unchanged. Internal file names still say `puffpal` — only the
+> user-facing title changed.
 
 Real, compile-checked PlatformIO + Arduino firmware for the folding
 replacement actuator: Seeed XIAO nRF52840 + 1.54" 200×200 e-ink panel
@@ -18,10 +20,11 @@ are the proof that still has to happen on the real board.
 - **Sleep:** System ON idle (`__WFI()`) between events. The nRF52 RTC
   keeps `millis()` running across sleeps, so the debounce window, dose
   timestamps, and day counter all survive sleep. Target <30 µA (see §6).
-- **Dose counting:** reed switch closes when the canister is pressed →
-  GPIO interrupt wakes the CPU → one dose counted. Timestamp debounce:
-  presses <400 ms apart count as one (kills bounce bursts and
-  double-triggers; a real second puff is a full press cycle, ~1 s).
+- **Dose counting:** a microswitch under the press cap closes at the
+  bottom of the ~3.2 mm fire stroke → GPIO interrupt wakes the CPU →
+  one dose counted. Timestamp debounce: presses <400 ms apart count
+  as one (kills bounce bursts and double-triggers; a real second puff
+  is a full press cycle, ~1 s).
 - **Screen:** avatar face + doses left + lifetime puffs. Faces: happy
   (>20 left), concerned (≤20), empty (0), sleepy (no dose for 12 h+).
   Kind, never shaming — faces react only to device facts.
@@ -53,19 +56,18 @@ are the proof that still has to happen on the real board.
 | E-ink DC | D3 | Panel DC |
 | E-ink RST | D1 | Panel RST |
 | E-ink BUSY | D0 | Panel BUSY (HIGH = busy) |
-| Reed switch (NO) | D6 | Reed → GND (LOW = pressed) |
+| Microswitch (NO) | D6 | Microswitch under the press cap → GND (LOW = pressed) |
 | Button | D7 | Button → GND (LOW = pressed) |
 | LED | D4 | LED anode → 220 Ω → GND (HIGH = on) |
 | LiPo 301230 | BAT pads | XIAO battery pads (onboard charger + USB-C) |
 
 All pins are real XIAO nRF52840 pins (D0–D10; SPI on D8/D9/D10). Same
-pinout as the v3 firmware — no rewiring if you built v3, just the
-bigger panel.
+pinout as the v4 firmware — the microswitch lands on the same D6 pin.
 
 ## 3. Build + flash
 
 ```bash
-cd ~/workspace/asthma-tech/puffpal-firmware
+cd ~/workspace/asthma-tech/puffpal-v5/firmware
 pio run -e seeed_xiao_nrf52840
 ```
 
@@ -103,7 +105,7 @@ core), install the GxEPD2 library, open `src/main.cpp` as a sketch.
 ## 5. Bench tests (do these before trusting it with a real dose)
 
 1. **Count test:** 100 presses of the can, zero missed / zero double
-   (v3 build notes §5 step 9). If it double-counts, the reed is
+   (v3 build notes §5 step 9). If it double-counts, the microswitch is
    bouncing past the 400 ms window — lengthen `DEBOUNCE_MS` in
    `src/main.cpp`, don't add a capacitor first.
 2. **Sleep current:** meter in series with the battery, board asleep,

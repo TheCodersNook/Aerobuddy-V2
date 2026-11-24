@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AeroBuddy v2 (PuffPal v4) — dose-logic simulation.
+"""AeroBuddy v5 (v4 lineage: PuffPal v4 / AeroBuddy v2) — dose-logic simulation.
 
 Mirrors the firmware state machine in src/main.cpp exactly:
   * 400 ms timestamp debounce (presses closer than that count as one)
@@ -61,8 +61,8 @@ class DoseCounter:
         self.time_offset_sec = epoch - t_ms // 1000
         self.time_set = True
 
-    # -- reed (mirrors onReedEvent/countDose) --
-    def reed_close(self, t_ms):
+    # -- microswitch (mirrors onSwitchEvent/countDose) --
+    def switch_close(self, t_ms):
         if (self.last_dose_ms is not None
                 and t_ms - self.last_dose_ms < DEBOUNCE_MS):
             return False  # bounce / double-trigger: ignored
@@ -112,17 +112,17 @@ class DoseCounter:
 def case_bounce():
     c = DoseCounter()
     t = 1_000_000
-    counted = sum(c.reed_close(t + i * 3) for i in range(12))  # 12 edges, 33 ms
+    counted = sum(c.switch_close(t + i * 3) for i in range(12))  # 12 edges, 33 ms
     assert counted == 1, f"bounce burst counted {counted}, want 1"
     assert c.doses_left == 199 and c.total_puffs == 1
 
 
 def case_rapid_double_press():
     c = DoseCounter()
-    assert c.reed_close(1_000_000) is True
-    assert c.reed_close(1_000_200) is False   # 200 ms later: same press
-    assert c.reed_close(1_000_600) is True    # 600 ms after first: new puff
-    assert c.reed_close(1_001_200) is True    # 600 ms after that: new puff
+    assert c.switch_close(1_000_000) is True
+    assert c.switch_close(1_000_200) is False   # 200 ms later: same press
+    assert c.switch_close(1_000_600) is True    # 600 ms after first: new puff
+    assert c.switch_close(1_001_200) is True    # 600 ms after that: new puff
     assert c.total_puffs == 3, f"total {c.total_puffs}, want 3"
     assert c.doses_left == 197
 
@@ -131,15 +131,15 @@ def case_normal_day():
     c = DoseCounter()
     t = 8 * 3600_000  # 08:00 day 0
     for i in range(4):
-        assert c.reed_close(t + i * 3_600_000) is True  # hourly puffs
+        assert c.switch_close(t + i * 3_600_000) is True  # hourly puffs
     assert c.daily_counts(0)[6] == 4
     assert c.total_puffs == 4 and c.doses_left == 196
 
 
 def case_midnight_rollover():
     c = DoseCounter()
-    assert c.reed_close(DAY_MS - 10_000) is True   # 23:59:50 day 0
-    assert c.reed_close(DAY_MS + 10_000) is True   # 00:00:10 day 1
+    assert c.switch_close(DAY_MS - 10_000) is True   # 23:59:50 day 0
+    assert c.switch_close(DAY_MS + 10_000) is True   # 00:00:10 day 1
     dc = c.daily_counts(1)
     assert dc[5] == 1 and dc[6] == 1, f"day split {dc}, want [..,1,1]"
     assert c.total_puffs == 2
@@ -148,7 +148,7 @@ def case_midnight_rollover():
 def case_long_press_reset():
     c = DoseCounter()
     for i in range(5):
-        c.reed_close(1_000_000 + i * 60_000)
+        c.switch_close(1_000_000 + i * 60_000)
     assert c.doses_left == 195
     assert c.long_press(2_000_000) == "confirm"
     assert c.short_press(2_005_000) == "reset"     # confirm within 10 s
@@ -166,7 +166,7 @@ def case_heavy_use_day():
     c = DoseCounter()
     t = 9 * 3600_000
     for i in range(12):  # 12 puffs, 30 s apart (bad asthma day)
-        assert c.reed_close(t + i * 30_000) is True, f"missed puff {i}"
+        assert c.switch_close(t + i * 30_000) is True, f"missed puff {i}"
     assert c.daily_counts(0)[6] == 12
     assert c.total_puffs == 12 and c.doses_left == 188
 
@@ -174,10 +174,10 @@ def case_heavy_use_day():
 def case_empty_canister():
     c = DoseCounter()
     for i in range(200):
-        assert c.reed_close(1_000_000 + i * 1000) is True
+        assert c.switch_close(1_000_000 + i * 1000) is True
     assert c.doses_left == 0
     for i in range(5):  # pressing an empty can: logged, never negative
-        assert c.reed_close(1_500_000 + i * 1000) is True
+        assert c.switch_close(1_500_000 + i * 1000) is True
     assert c.doses_left == 0 and c.total_puffs == 205
 
 
@@ -192,8 +192,8 @@ def case_settime_midnight():
     c = DoseCounter()
     epoch_midnight = calendar.timegm((2026, 11, 23, 0, 0, 0))
     c.settime(epoch_midnight, 0)  # clock set at virtual t=0
-    c.reed_close(86_390_000)      # 23:59:50 Nov 22 UTC
-    c.reed_close(86_410_000)      # 00:00:10 Nov 23 UTC
+    c.switch_close(86_390_000)      # 23:59:50 Nov 22 UTC
+    c.switch_close(86_410_000)      # 00:00:10 Nov 23 UTC
     days = sorted({d for (d, _m, _b, _l) in c.log})
     assert len(days) == 2, f"SETTIME midnight split failed: {days}"
     # "today" is Nov 24: yesterday (Nov 23) has 1, today has 1.
@@ -205,7 +205,7 @@ def case_seven_day_week():
     plan = [2, 0, 4, 1, 3, 6, 2]  # puffs per day, days 0..6
     for d, n in enumerate(plan):
         for i in range(n):
-            assert c.reed_close(d * DAY_MS + 8 * 3600_000 + i * 60_000)
+            assert c.switch_close(d * DAY_MS + 8 * 3600_000 + i * 60_000)
     dc = c.daily_counts(6)
     assert dc == plan, f"weekly bars {dc}, want {plan}"
     assert sum(dc) == 18 and c.total_puffs == 18
